@@ -1,7 +1,7 @@
 import {
   collection,
   doc,
-  getDocs,
+  getDoc,
   onSnapshot,
   query,
   serverTimestamp,
@@ -26,11 +26,17 @@ function randomJoinCode(length = 6): string {
   return out;
 }
 
+// The join code doubles as the team's document ID. That turns "look up a team
+// by its code" into a direct, narrowly-scoped get() instead of an open query
+// over the whole teams collection — which matters for security: a query would
+// need "list" access on the collection, letting any signed-in user enumerate
+// every team's invite code. A get() only reveals the one team whose exact code
+// the caller already has.
 async function generateUniqueJoinCode(): Promise<string> {
   for (let attempt = 0; attempt < 6; attempt++) {
     const code = randomJoinCode();
-    const snap = await getDocs(query(collection(db, "teams"), where("joinCode", "==", code)));
-    if (snap.empty) return code;
+    const snap = await getDoc(doc(db, "teams", code));
+    if (!snap.exists()) return code;
   }
   throw new Error("Couldn't generate a join code right now. Please try again.");
 }
@@ -75,44 +81,42 @@ function toAssignment(snap: QueryDocumentSnapshot<DocumentData>): Assignment {
 /** Creates a new team and registers the current user as its master. */
 export async function createTeamAndMaster(uid: string, name: string, teamName: string) {
   const joinCode = await generateUniqueJoinCode();
-  const teamRef = doc(collection(db, "teams"));
-  const userRef = doc(db, "users", uid);
 
-  const batch = writeBatch(db);
-  batch.set(teamRef, {
+  // Two sequential writes rather than one batch: security rules evaluate a
+  // batch's writes independently, so the user-doc write below needs the team
+  // to already be committed in order to verify masterUid against it.
+  await setDoc(doc(db, "teams", joinCode), {
     name: teamName.trim(),
     masterUid: uid,
     joinCode,
     createdAt: serverTimestamp(),
   });
-  batch.set(userRef, {
+  await setDoc(doc(db, "users", uid), {
     name: name.trim(),
     role: "master",
-    teamId: teamRef.id,
+    teamId: joinCode,
     createdAt: serverTimestamp(),
   });
-  await batch.commit();
 
-  return { teamId: teamRef.id, joinCode };
+  return { teamId: joinCode, joinCode };
 }
 
 /** Joins an existing team as a client using its join code. */
 export async function joinTeamAsClient(uid: string, name: string, joinCode: string) {
   const normalized = joinCode.trim().toUpperCase();
-  const snap = await getDocs(query(collection(db, "teams"), where("joinCode", "==", normalized)));
-  if (snap.empty) {
+  const teamSnap = await getDoc(doc(db, "teams", normalized));
+  if (!teamSnap.exists()) {
     throw new Error("No team found with that code. Double-check and try again.");
   }
-  const teamDoc = snap.docs[0];
   const userRef = doc(db, "users", uid);
   await setDoc(userRef, {
     name: name.trim(),
     role: "client",
-    teamId: teamDoc.id,
+    teamId: normalized,
     createdAt: serverTimestamp(),
   });
 
-  return { teamId: teamDoc.id };
+  return { teamId: normalized };
 }
 
 export function subscribeUserProfile(
