@@ -1,0 +1,156 @@
+rules_version = '2';
+
+// Data model
+//   teams/{joinCode}        { name, masterUid, joinCode, createdAt }
+//   users/{uid}             { name, role: 'master'|'client', teamId, createdAt }
+//   tasks/{taskId}          { teamId, title, description, createdBy, assignedTo, createdAt }
+//   assignments/{id}        { taskId, teamId, assigneeUid, title, description,
+//                             assignedAt, completed, completedAt }
+//
+// Anti-cheat / fair-play design:
+//   - A user's role and team are set once at signup and are immutable from then on
+//     (no self-promotion to master, no silently switching teams).
+//   - Only a team's master can create tasks/assignments, and only for clients who
+//     are actually members of that team.
+//   - A client can only ever flip their OWN assignment from incomplete to complete.
+//     completedAt must equal the server's request.time (never a client-supplied
+//     value), the transition is one-way, and no other field on the assignment may
+//     change in that same write. So a client can't backdate, fabricate, or reverse
+//     a completion, and can't see or touch anyone else's tasks.
+//   - The team's join code is also its document ID, so finding a team by code is a
+//     single-document get(), not an open query — nobody can enumerate other teams'
+//     invite codes.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function hasProfile() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function myTeamId() {
+      return myUserDoc().data.teamId;
+    }
+
+    function isMasterOfTeam(teamId) {
+      return hasProfile() && myUserDoc().data.role == 'master' && myTeamId() == teamId;
+    }
+
+    // ---- teams ----
+    match /teams/{teamId} {
+      allow get: if signedIn();
+
+      // The team is created first (by whoever will become its master), then
+      // the master's own user doc is created right after, pointing back at
+      // this team. Writes within one batch can't see each other's pending
+      // state in rules, so these happen as two sequential writes — the
+      // user-doc rule below is what actually confirms this team's masterUid
+      // matches the caller.
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['name', 'masterUid', 'joinCode', 'createdAt'])
+        && teamId == request.resource.data.joinCode
+        && request.resource.data.masterUid == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.createdAt == request.time;
+
+      allow update, delete: if false;
+    }
+
+    // ---- users ----
+    match /users/{uid} {
+      // Any signed-in teammate can look up names in their own team (needed to
+      // show client names on the master's dashboard); everyone can read their
+      // own profile regardless.
+      allow get: if signedIn() && (request.auth.uid == uid || (hasProfile() && myTeamId() == resource.data.teamId));
+      allow list: if hasProfile() && resource.data.teamId == myTeamId();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'role', 'teamId', 'createdAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.createdAt == request.time
+        && (
+          (
+            request.resource.data.role == 'master'
+            && exists(/databases/$(database)/documents/teams/$(request.resource.data.teamId))
+            && get(/databases/$(database)/documents/teams/$(request.resource.data.teamId)).data.masterUid == request.auth.uid
+          ) || (
+            request.resource.data.role == 'client'
+            && exists(/databases/$(database)/documents/teams/$(request.resource.data.teamId))
+          )
+        );
+
+      // Profile (role + team) is fixed for life once created — this is what
+      // stops a client from ever granting themselves master, or hopping teams.
+      allow update, delete: if false;
+    }
+
+    // ---- tasks ----
+    // Historical record of what was assigned; the app reads per-client state
+    // from `assignments` instead, so tasks only need write access for masters.
+    match /tasks/{taskId} {
+      allow get, list: if isMasterOfTeam(resource.data.teamId);
+
+      allow create: if isMasterOfTeam(request.resource.data.teamId)
+        && request.resource.data.keys().hasOnly(['teamId', 'title', 'description', 'createdBy', 'assignedTo', 'createdAt'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.assignedTo is list
+        && request.resource.data.assignedTo.size() > 0
+        && request.resource.data.createdAt == request.time;
+
+      allow update, delete: if false;
+    }
+
+    // ---- assignments ----
+    match /assignments/{assignmentId} {
+      // A client only ever sees their own assignments; a master sees every
+      // assignment for their team (but not other teams').
+      allow get, list: if signedIn() && (
+        resource.data.assigneeUid == request.auth.uid ||
+        isMasterOfTeam(resource.data.teamId)
+      );
+
+      allow create: if isMasterOfTeam(request.resource.data.teamId)
+        && request.resource.data.keys().hasOnly(
+             ['taskId', 'teamId', 'assigneeUid', 'title', 'description', 'assignedAt', 'completed', 'completedAt']
+           )
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.assigneeUid))
+        && get(/databases/$(database)/documents/users/$(request.resource.data.assigneeUid)).data.role == 'client'
+        && get(/databases/$(database)/documents/users/$(request.resource.data.assigneeUid)).data.teamId == request.resource.data.teamId
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.completed == false
+        && request.resource.data.completedAt == null
+        && request.resource.data.assignedAt == request.time;
+
+      // The one-way, server-timestamped completion flip described above.
+      allow update: if signedIn()
+        && request.auth.uid == resource.data.assigneeUid
+        && request.resource.data.keys().hasOnly(
+             ['taskId', 'teamId', 'assigneeUid', 'title', 'description', 'assignedAt', 'completed', 'completedAt']
+           )
+        && resource.data.completed == false
+        && request.resource.data.completed == true
+        && request.resource.data.completedAt == request.time
+        && request.resource.data.taskId == resource.data.taskId
+        && request.resource.data.teamId == resource.data.teamId
+        && request.resource.data.assigneeUid == resource.data.assigneeUid
+        && request.resource.data.title == resource.data.title
+        && request.resource.data.description == resource.data.description
+        && request.resource.data.assignedAt == resource.data.assignedAt;
+
+      allow delete: if false;
+    }
+  }
+}
